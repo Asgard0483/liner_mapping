@@ -18,6 +18,11 @@ SECTION_ANGLES = 72
 DIFF_DZ_MM = 10.0
 
 
+def _counts_text(counts):
+    lo, hi = min(counts), max(counts)
+    return str(lo) if lo == hi else "%d–%d" % (lo, hi)
+
+
 def _r(v, nd=2):
     return None if v is None else round(v, nd)
 
@@ -38,7 +43,10 @@ def report_data(comp, title="Liner-Vergleich"):
             "bezug": "außen" if rec.get("umfang_bezug") == "OUTER" else "innen",
             "distal": m.distal_mm,
             "laenge": rec.get("laenge_cm") or 0.0,
-            "gemessen": [{"h": h, "t": list(t), "c": c} for h, t, c in m.rows],
+            "punkte_je_hoehe": _counts_text(m.counts),
+            # gemessene Werte genau in den Richtungen A, M, P, L (für die Verlaufsdiagramme)
+            "mess": [[{"h": _r(h), "v": _r(t[k * len(t) // 4])} for h, t, _ in m.rows
+                      if (k * len(t)) % 4 == 0] for k in range(4)],
             "profil": {"h": [_r(z / 10.0) for z in zs],
                        "t": [[_r(p[k]) for p in prof] for k in range(4)]},
         })
@@ -83,8 +91,8 @@ def report_data(comp, title="Liner-Vergleich"):
             grid.append(row)
         diffs.append({"h": [_r(z / 10.0) for z in zs], "werte": grid})
 
-    points = [{"h": h, "k": k, "v": [_r(v) for v in vals], "gem": meas}
-              for h, k, vals, meas in comp["points"]]
+    points = [{"h": h, "w": label, "v": [_r(v) for v in vals], "gem": meas}
+              for h, _deg, label, vals, meas in comp["points"]]
 
     def clean(d):
         return None if d is None else {k: (_r(v) if isinstance(v, float) else v)
@@ -238,7 +246,7 @@ td.ip { color: var(--muted); }
   </div>
 
   <h2>Messwerte</h2>
-  <p class="sub">Grau = interpoliert (an dieser Höhe beim jeweiligen Liner nicht gemessen), – = außerhalb des Messbereichs.</p>
+  <p class="sub">Richtung: A/M/P/L oder Winkel ab anterior Richtung medial. Grau = interpoliert (an dieser Stelle beim jeweiligen Liner nicht gemessen), – = außerhalb des Messbereichs. Bei mehr als 16 Messpunkten pro Höhe zeigt die Tabelle ein 22,5°-Raster.</p>
   <div class="card scroll"><table id="points"></table></div>
 
   <h2>Stammdaten</h2>
@@ -403,7 +411,7 @@ function drawProfiles() {
       const d = l.profil.h.map((h, n) => (n ? "L" : "M") + X(h).toFixed(1) + " " + Y(l.profil.t[k][n]).toFixed(1)).join(" ");
       el("svg:path", { d, fill: "none", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round", style: { stroke: col(i) } }, svg);
     });
-    D.liner.forEach((l, i) => l.gemessen.forEach(g => el("svg:circle", { cx: X(g.h), cy: Y(g.t[k]), r: 4,
+    D.liner.forEach((l, i) => l.mess[k].forEach(g => el("svg:circle", { cx: X(g.h), cy: Y(g.v), r: 4,
       "stroke-width": 2, style: { fill: col(i), stroke: "var(--surface)" } }, svg)));
     const cross = el("svg:line", { y1: m.t, y2: H - m.b, stroke: css("--axis"), "stroke-width": 1, visibility: "hidden" }, svg);
     const hit = el("svg:rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent", class: "hit" }, svg);
@@ -414,7 +422,7 @@ function drawProfiles() {
       cross.setAttribute("x1", X(hs)); cross.setAttribute("x2", X(hs)); cross.setAttribute("visibility", "visible");
       const rows = D.liner.map((l, i) => {
         const n = l.profil.h.findIndex(v => Math.abs(v - hs) < 1e-6);
-        const meas = l.gemessen.some(g => Math.abs(g.h - hs) < 1e-6);
+        const meas = l.mess[k].some(g => Math.abs(g.h - hs) < 1e-6);
         return { slot: i, value: n < 0 ? "–" : fmt(l.profil.t[k][n], 1) + " mm", label: l.label + (meas ? " · gemessen" : "") };
       });
       showTip(ev, D.seiten[k] + " · " + fmt(hs, 1) + " cm", rows);
@@ -517,15 +525,17 @@ function drawTables() {
   t.replaceChildren();
   const head = el("tr", null, el("thead", null, t));
   el("th", null, head, "Höhe");
-  el("th", { class: "l" }, head, "Seite");
+  el("th", { class: "l" }, head, "Richtung");
   D.liner.forEach((l, i) => { const th = el("th", null, head); keyEl(th, i, "#" + (i + 1) + " mm"); });
   D.liner.slice(1).forEach((l, n) => el("th", null, head, "Δ #" + (n + 2) + " mm"));
   D.liner.slice(1).forEach((l, n) => el("th", null, head, "Δ #" + (n + 2) + " %"));
   const body = el("tbody", null, t);
+  let lastH = null;
   for (const p of D.punkte) {
     const tr = el("tr", null, body);
-    el("td", null, tr, p.k === 0 ? fmt(p.h, 0) + " cm" : "");
-    el("td", { class: "l" }, tr, D.seiten[p.k]);
+    el("td", null, tr, p.h !== lastH ? fmt(p.h, 1).replace(",0", "") + " cm" : "");
+    lastH = p.h;
+    el("td", { class: "l" }, tr, p.w);
     p.v.forEach((v, i) => el("td", { class: p.gem[i] ? "" : "ip" }, tr, fmt(v, 1)));
     const ref = p.v[0];
     p.v.slice(1).forEach(v => el("td", null, tr, ref == null || v == null ? "–" : sgn(v - ref, 1)));
@@ -536,7 +546,8 @@ function drawTables() {
   const cols = [["#", (l, i) => "#" + (i + 1)], ["Hersteller", l => l.meta.hersteller], ["Artikel", l => l.meta.artikel],
     ["Größe", l => l.meta.groesse], ["Form", l => l.meta.form], ["Material", l => l.meta.material],
     ["Nenn-Wand", l => l.nenn ? fmt(l.nenn, 1) + " mm" : "–"], ["distal", l => fmt(l.distal, 1) + " mm"],
-    ["Länge", l => l.laenge ? fmt(l.laenge, 1) + " cm" : "–"], ["Seite", l => l.seite], ["Umfang", l => l.bezug],
+    ["Länge", l => l.laenge ? fmt(l.laenge, 1) + " cm" : "–"], ["Punkte/Höhe", l => l.punkte_je_hoehe],
+    ["Seite", l => l.seite], ["Umfang", l => l.bezug],
     ["Notiz", l => l.meta.notiz]];
   const hr = el("tr", null, el("thead", null, m));
   cols.forEach(([h], n) => el("th", { class: n > 5 && n < 9 ? "" : "l" }, hr, h));
@@ -554,7 +565,7 @@ function drawTables() {
 (function () {
   const m = document.getElementById("method"), w = Math.round(D.gewicht_wand * 100);
   const p = t => el("p", null, m, t);
-  p("Alle Liner werden im anatomischen Bezugssystem (anterior, medial, posterior, lateral) verglichen – unabhängig von der erfassten Seite. Zwischen den vier Messrichtungen wird glatt (trigonometrisch), zwischen den Höhen monoton kubisch interpoliert. Verglichen wird nur im gemeinsamen Höhenbereich, auf einem Raster von 1 cm × 22,5°.");
+  p("Alle Liner werden im anatomischen Bezugssystem (anterior, medial, posterior, lateral) verglichen – unabhängig von der erfassten Seite. Über den Umfang wird zwischen den Messpunkten monoton kubisch interpoliert (exakt durch jeden Messpunkt, ohne Überschwingen; ein einzelner Punkt gilt rundum), zwischen den Höhen ebenfalls monoton kubisch. Verglichen wird nur im gemeinsamen Höhenbereich, auf einem Raster von 1 cm × 22,5°.");
   p("Ähnlichkeit Wand = 100 % × (1 − mittlere |Δ Wandstärke| ÷ mittlere Wandstärke beider Liner).");
   p("Ähnlichkeit Form = 100 % × (1 − mittlere |Δ Innenumfang| ÷ mittlerer Innenumfang beider Liner).");
   p("Gesamt = " + w + " % Wand + " + (100 - w) + " % Form. Die Muster-Korrelation r (−1…1) zeigt, ob die Wandstärken gleich verteilt sind (z. B. beide posterior dicker) – unabhängig vom absoluten Niveau.");

@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from liner_wandstaerke import compare, report  # noqa: E402
 from liner_wandstaerke.database import LinerDB, empty_record  # noqa: E402
 from liner_wandstaerke.geometry import (  # noqa: E402
-    LinerModel, Pchip, build_liner_geometry, ring_thickness)
+    LinerModel, PeriodicPchip, Pchip, build_liner_geometry, marker_positions, point_angles,
+    resample_ring, ring_thickness)
 
 HEIGHTS = (4, 8, 12, 16, 20, 25, 30)
 CIRC = (24, 27, 29.5, 31.5, 33, 34.5, 36)
@@ -60,6 +61,74 @@ class GeometryTests(unittest.TestCase):
             LinerModel([(4, (5, 5, 5, 5), 25), (4, (5, 5, 5, 5), 26)])
 
 
+class VariablePointsTests(unittest.TestCase):
+    def test_ring_exact_and_bounded(self):
+        for n in (1, 2, 3, 4, 7, 12, 360):
+            vals = [3.0 + (k * 7 % 5) * 0.6 for k in range(n)]
+            ring = PeriodicPchip(vals)
+            for a, v in zip(point_angles(n), vals):
+                self.assertAlmostEqual(ring(a), v)
+            xs = [ring(2 * math.pi * i / 1000) for i in range(1000)]
+            self.assertGreaterEqual(min(xs), min(vals) - 1e-9)
+            self.assertLessEqual(max(xs), max(vals) + 1e-9)
+
+    def test_single_point_is_constant(self):
+        ring = PeriodicPchip([4.2])
+        self.assertTrue(all(abs(ring(a) - 4.2) < 1e-12 for a in (0, 1, 2, 3, 6)))
+
+    def test_resample_keeps_measured_points(self):
+        vals = [7.0, 4.0, 9.0, 3.0]
+        r8 = resample_ring(vals, 8)
+        self.assertEqual([round(v, 9) for v in r8[::2]], vals)
+        self.assertEqual([round(v, 9) for v in resample_ring(r8, 4)], vals)
+
+    def test_mixed_counts_model(self):
+        n360 = [5.0 + math.sin(math.radians(k)) for k in range(360)]
+        rows = [(4, (6.0,), 24), (12, (7, 4, 9, 3), 29), (20, tuple(n360), 33),
+                (30, (3, 3.5, 3, 2.5, 3, 3.5), 36)]
+        m = LinerModel(rows)
+        self.assertEqual(m.grid_n, 360)
+        for h, t, _ in rows:
+            for a, v in zip(point_angles(len(t)), t):
+                self.assertAlmostEqual(m.thickness(h * 10, a), v, places=9)
+                self.assertTrue(m.measured_at(h * 10, a))
+        self.assertFalse(m.measured_at(120, math.radians(45)))
+        verts, faces, thick, info = build_liner_geometry(rows, segments=48)
+        edges = {}
+        for f in faces:
+            for a, b in zip(f, f[1:] + f[:1]):
+                key = (min(a, b), max(a, b))
+                edges[key] = edges.get(key, 0) + 1
+        self.assertTrue(all(n == 2 for n in edges.values()))
+        # Marker: höchstens 36 pro Höhe
+        marks = marker_positions(rows)
+        self.assertEqual(len(marks), 1 + 4 + 36 + 6)
+
+    def test_limits(self):
+        with self.assertRaises(ValueError):
+            LinerModel([(4, tuple([5.0] * 361), 25)])
+        with self.assertRaises(ValueError):
+            LinerModel([(4, (), 25)])
+
+    def test_compare_mixed_counts(self):
+        a = make_record("A")
+        b = make_record("B")
+        b["messungen"] = [(h, tuple(resample_ring(t, 8)), c) for h, t, c in b["messungen"]]
+        b["messungen"][2] = (12, (5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5), 29.5)
+        a["id"], b["id"] = 1, 2
+        r = compare.compare_models(compare.model_from_record(a), compare.model_from_record(b))
+        self.assertGreater(r["aehnlichkeit"], 90)
+        pts = compare.point_table([compare.model_from_record(a), compare.model_from_record(b)])
+        at12 = [p for p in pts if p[0] == 12.0]
+        self.assertEqual(len(at12), 12)  # Vereinigung aus 4 und 12 Punkten
+        labels = [p[2] for p in at12]
+        self.assertEqual(labels[:4], ["A", "30°", "60°", "M"])
+        self.assertEqual(at12[3][4], [True, True])  # M bei beiden gemessen
+        self.assertEqual(at12[1][4], [False, True])
+        html = report.render_html(compare.build_comparison([a, b]))
+        self.assertIn("8–12", html)
+
+
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -96,6 +165,65 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(self.db.search(text="zylin")), 1)
         self.assertEqual(self.db.distinct("groesse"), ["10", "26", "28"])
         self.assertEqual(self.db.distinct("groesse", {"hersteller": "Alpha"}), ["26", "28"])
+
+    def test_variable_points_roundtrip(self):
+        rec = make_record()
+        rec["messungen"][0] = (4, (6.5,), 24)
+        rec["messungen"][3] = (16, tuple(4 + k / 360 for k in range(360)), 31.5)
+        rid = self.db.save(rec)
+        got = self.db.get(rid)["messungen"]
+        self.assertEqual(got[0][1], (6.5,))
+        self.assertEqual(len(got[3][1]), 360)
+        self.assertEqual(self.db.search()[0]["punkte"], [1, 4, 4, 360, 4, 4, 4])
+        path = os.path.join(self.tmp.name, "v.csv")
+        self.db.export_csv(path)
+        ids = self.db.import_csv(path)
+        back = self.db.get(ids[0])["messungen"]
+        self.assertEqual([len(t) for _, t, _ in back], [len(t) for _, t, _ in got])
+        for (_, t1, _), (_, t2, _) in zip(back, got):
+            self.assertTrue(all(abs(a - b) < 1e-4 for a, b in zip(t1, t2)))
+        with self.assertRaises(ValueError):
+            self.db.save(dict(rec, id=None, messungen=[(4, tuple([5.0] * 361), 24)]))
+
+    def test_migration_from_v1(self):
+        import sqlite3
+        path = os.path.join(self.tmp.name, "alt.sqlite")
+        con = sqlite3.connect(path)
+        con.executescript("""
+            CREATE TABLE liner (id INTEGER PRIMARY KEY AUTOINCREMENT,
+              hersteller TEXT NOT NULL DEFAULT '', artikel TEXT NOT NULL DEFAULT '',
+              groesse TEXT NOT NULL DEFAULT '', form TEXT NOT NULL DEFAULT '',
+              material TEXT NOT NULL DEFAULT '', notiz TEXT NOT NULL DEFAULT '',
+              nenn_wandstaerke_mm REAL NOT NULL DEFAULT 0, seite TEXT NOT NULL DEFAULT 'RIGHT',
+              umfang_bezug TEXT NOT NULL DEFAULT 'INNER', distal_mm REAL NOT NULL DEFAULT 8,
+              laenge_cm REAL NOT NULL DEFAULT 0, erstellt TEXT NOT NULL, geaendert TEXT NOT NULL);
+            CREATE TABLE messung (liner_id INTEGER NOT NULL REFERENCES liner(id) ON DELETE CASCADE,
+              hoehe_cm REAL NOT NULL, a_mm REAL NOT NULL, m_mm REAL NOT NULL, p_mm REAL NOT NULL,
+              l_mm REAL NOT NULL, umfang_cm REAL NOT NULL, PRIMARY KEY (liner_id, hoehe_cm));
+            INSERT INTO liner (hersteller, erstellt, geaendert) VALUES ('Alt', 'x', 'x');
+            INSERT INTO messung VALUES (1, 4, 6, 5, 7, 4, 24), (1, 8, 5, 5, 5, 5, 27);
+        """)
+        con.commit()
+        con.close()
+        db = LinerDB(path)
+        rec = db.get(1)
+        self.assertEqual(rec["messungen"], [(4.0, (6.0, 5.0, 7.0, 4.0), 24.0),
+                                            (8.0, (5.0, 5.0, 5.0, 5.0), 27.0)])
+        db.save(dict(rec, id=None))
+        self.assertEqual(db.count(), 2)
+        db.close()
+        LinerDB(path).close()  # erneutes Öffnen ohne Fehler
+
+    def test_import_v1_csv(self):
+        path = os.path.join(self.tmp.name, "v1.csv")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("liner_nr;hersteller;artikel;groesse;form;material;notiz;"
+                    "nenn_wandstaerke_mm;distal_mm;laenge_cm;seite;umfang_bezug;hoehe_cm;"
+                    "anterior_mm;medial_mm;posterior_mm;lateral_mm;umfang_cm\n"
+                    "1;Alt;X;26;;;;3;8;32;RIGHT;INNER;4;6;5;7;4;24\n"
+                    "1;Alt;X;26;;;;3;8;32;RIGHT;INNER;8;5,5;5;5;5;27\n")
+        ids = self.db.import_csv(path)
+        self.assertEqual(self.db.get(ids[0])["messungen"][1], (8.0, (5.5, 5.0, 5.0, 5.0), 27.0))
 
     def test_csv_roundtrip(self):
         self.db.save(make_record("Alpha"))

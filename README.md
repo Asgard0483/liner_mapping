@@ -19,15 +19,27 @@ Netzlaufwerk kann von mehreren Arbeitsplätzen genutzt werden (nicht gleichzeiti
 
 * **Stammdaten:** Hersteller, Artikel, Größe, Form, Nenn-Wandstärke (laut Hersteller),
   Material, Notiz. Bereits vorhandene Werte werden beim Tippen vorgeschlagen.
-* **Messtabelle:** Höhen von distal (Standard 4, 8, 12, 16, 20, 25, 30 cm), je Höhe vier
-  Wandstärken in mm und der Umfang in cm.
+* **Messhöhen:** Höhen von distal (Standard 4, 8, 12, 16, 20, 25, 30 cm), je Höhe die
+  **Anzahl der Messpunkte (1–360)** und der Umfang in cm.
+* **Messpunkte:** Die Punkte liegen gleichmäßig über den Umfang verteilt, beginnend
+  **anterior (0°)** und weiter Richtung medial. Unter der Liste erscheinen die
+  Eingabefelder der markierten Höhe, beschriftet mit Richtung bzw. Winkel.
 
-  | Spalte | Lage      | Winkel |
-  |--------|-----------|--------|
-  | A      | anterior  | 0°     |
-  | M      | medial    | 90°    |
-  | P      | posterior | 180°   |
-  | L      | lateral   | 270°   |
+  | Punkte | Lage der Punkte                                   |
+  |--------|---------------------------------------------------|
+  | 1      | ein Wert, gilt rundum                              |
+  | 2      | A, P                                              |
+  | 4      | A, M, P, L (Standard)                             |
+  | 8      | A, 45°, M, 135°, P, 225°, L, 315°                 |
+  | 360    | alle 1°                                           |
+
+  Wird die Punktzahl geändert, werden die vorhandenen Werte umgerechnet (z. B. 4 → 8:
+  A/M/P/L bleiben, die Zwischenpunkte werden interpoliert). Jede Höhe kann eine andere
+  Punktzahl haben.
+* Knöpfe über den Eingabefeldern: **Alle Punkte gleich** (ersten Wert übernehmen),
+  **Einfügen** (Werte aus der Zwischenablage, z. B. eine Excel-Spalte – die Anzahl der
+  Werte bestimmt die Punktzahl, Dezimalkomma erlaubt), **Alle Höhen** (gleiche
+  Punktzahl für alle Höhen).
 
 * Umfang wahlweise innen (Stumpf) oder außen über dem Liner gemessen, distale Wandstärke,
   Gesamtlänge, Seite (rechts/links).
@@ -46,8 +58,10 @@ Netzlaufwerk kann von mehreren Arbeitsplätzen genutzt werden (nicht gleichzeiti
   alle/keine auswählen · löschen.
 * **Ähnliche suchen:** vergleicht die Referenz mit allen Linern der gefilterten Liste
   und sortiert nach Ähnlichkeit (Spalte „%“).
-* Import/Export der ganzen Datenbank als CSV (Trennzeichen `;`, eine Zeile pro Messhöhe –
-  lässt sich in Excel öffnen).
+* Import/Export der ganzen Datenbank als CSV (Trennzeichen `;`, eine Zeile pro Messhöhe,
+  Spalten `anzahl_punkte` und `w1 … wN` für die Wandstärken – lässt sich in Excel öffnen).
+  Dateien im alten Format (Spalten anterior/medial/posterior/lateral) werden weiterhin
+  gelesen; bestehende Datenbanken werden beim Öffnen automatisch umgestellt.
 
 ## 3. Vergleich (Panel „Vergleich“)
 
@@ -83,8 +97,10 @@ gleich *verteilt* sind (z. B. beide posterior dicker), unabhängig vom absoluten
 
 * Z nach oben, Z = 0 = distales Ende außen, −Y = anterior, medial = +X (rechts) bzw. −X (links),
   Maßstab 1:1 in Metern; das Mesh ist geschlossen und kann direkt als STL exportiert werden.
-* Interpolation: zwischen den vier Messrichtungen glatt (trigonometrisch), zwischen den
-  Höhen monoton kubisch – ohne Überschwingen.
+* Interpolation: über den Umfang periodisch monoton kubisch (läuft exakt durch jeden
+  Messpunkt, ohne Überschwingen; 1 Punkt = rundum gleich), zwischen den Höhen monoton
+  kubisch. Höhen mit unterschiedlicher Punktzahl werden auf ein gemeinsames Winkelraster
+  gebracht, auf dem jeder Messpunkt exakt liegt.
 * Unter der untersten Messhöhe: ellipsoide distale Kappe mit der distalen Wandstärke.
 * Vertex-Attribute: `Wandstaerke_mm`, bei Differenz-Modellen zusätzlich `Differenz_mm`.
 

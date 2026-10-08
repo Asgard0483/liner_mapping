@@ -27,7 +27,7 @@ assert len(st.rows) == 7, len(st.rows)
 
 # 1) Liner erfassen und speichern
 st.hersteller, st.artikel, st.groesse, st.form, st.nenn_mm = "Alpha", "Classic", "26", "konisch", 3.0
-st.rows[2].thickness_mm = (7, 4, 9, 3)
+ui.set_row_values(st.rows[2], (7, 4, 9, 3))
 assert bpy.ops.liner.build() == {"FINISHED"}
 assert bpy.ops.liner.save_record() == {"FINISHED"}
 first = st.current_id
@@ -41,6 +41,51 @@ try:
 except RuntimeError:
     res = {"CANCELLED"}
 assert res == {"CANCELLED"}, res
+
+# 1b) variable Punktzahl je Höhe
+bpy.ops.liner.new_record()
+st.hersteller, st.artikel = "Delta", "Varia"
+st.active_index = 2
+row = st.rows[2]
+ui.set_row_values(row, (7, 4, 9, 3))
+row.n_points = 8                                   # umrechnen 4 -> 8
+vals = ui.row_values(row)
+assert len(vals) == 8 and [round(v, 4) for v in vals[::2]] == [7, 4, 9, 3], vals
+row.n_points = 4                                   # zurück: Messwerte bleiben erhalten
+assert [round(v, 4) for v in ui.row_values(row)] == [7, 4, 9, 3]
+row.n_points = 1
+assert len(row.values) == 1
+# Einfügen aus Text (Excel-Spalte, Dezimalkomma)
+assert bpy.ops.liner.paste_values(text="5,5\n6\n6,5\n7\n6,5\n6") == {"FINISHED"}
+assert ui.row_values(row) == [5.5, 6.0, 6.5, 7.0, 6.5, 6.0] and row.n_points == 6
+assert ui.parse_numbers("4.5,5,6") == [4.5, 5.0, 6.0]
+assert ui.parse_numbers("4,5; 5; 6") == [4.5, 5.0, 6.0]
+# 360 Punkte in einer Höhe, 1 Punkt in einer anderen
+st.active_index = 4
+bpy.ops.liner.paste_values(text=" ".join("%.2f" % (4 + (k % 90) / 90) for k in range(360)))
+assert st.rows[4].n_points == 360
+ui.set_row_values(st.rows[0], [6.0])
+import time
+t0 = time.time()
+assert bpy.ops.liner.build() == {"FINISHED"}
+print("Build mit 1/4/6/360 Punkten: %.2f s" % (time.time() - t0))
+assert len(bpy.data.collections["Liner-Messpunkte"].objects) <= 7 * 36
+assert bpy.ops.liner.save_record() == {"FINISHED"}
+delta_id = st.current_id
+# CSV der Erfassung: Export und Re-Import
+ed_csv = os.path.join(tmp, "delta.csv")
+bpy.ops.liner.export_csv(filepath=ed_csv)
+before = ui._rows_as_tuples(st)
+bpy.ops.liner.new_record()
+assert bpy.ops.liner.import_csv(filepath=ed_csv) == {"FINISHED"}
+after = ui._rows_as_tuples(st)
+assert [len(t) for _, t, _ in after] == [len(t) for _, t, _ in before]
+assert st.hersteller == "Delta"
+# Punktzahl für alle Höhen
+bpy.ops.liner.set_points_all(n_points=12)
+assert all(r.n_points == 12 and len(r.values) == 12 for r in st.rows)
+with ui.open_db() as db:
+    db.delete(delta_id)
 
 # 2) weitere Liner direkt in die DB
 with ui.open_db() as db:
@@ -67,17 +112,18 @@ assert ui._suggestions("hersteller") == ["Alpha", "Beta", "Gamma"]
 # 3) Laden zum Bearbeiten
 st.db_index = [it.db_id for it in st.db_items].index(first)
 assert bpy.ops.liner.db_load() == {"FINISHED"}
-assert (st.hersteller, st.current_id, tuple(st.rows[2].thickness_mm)) == ("Alpha", first, (7, 4, 9, 3))
+assert (st.hersteller, st.current_id, ui.row_values(st.rows[2])) == ("Alpha", first, [7, 4, 9, 3])
 
 # 4) Referenz + Ähnlichkeitssuche
-st.db_index = [it.db_id for it in st.db_items].index(3)  # Beta
+st.db_index = [it.name for it in st.db_items].index("Beta Beta Liner Gr. 26")
+beta_id = st.db_items[st.db_index].db_id
 bpy.ops.liner.db_set_ref()
-assert st.ref_id == 3
+assert st.ref_id == beta_id
 assert bpy.ops.liner.db_similar() == {"FINISHED"}
 order = [it.db_id for it in st.db_items]
 scores = [round(it.score) for it in st.db_items]
 print("Ähnlichkeit zu Beta:", list(zip([it.name for it in st.db_items], scores)))
-assert order[0] == 3 and scores == sorted(scores, reverse=True)
+assert order[0] == beta_id and scores == sorted(scores, reverse=True)
 
 # 5) Vergleich
 bpy.ops.liner.db_select(action="ALL")

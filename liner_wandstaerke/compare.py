@@ -15,7 +15,7 @@ Werte unter 0 werden auf 0 begrenzt.
 import math
 
 from .database import record_label
-from .geometry import SIDES, SIDE_ANGLES_DEG, LinerModel, ring_thickness
+from .geometry import SIDES, SIDE_ANGLES_DEG, LinerModel, point_label
 
 DEFAULT_WALL_WEIGHT = 0.7
 GRID_DZ_MM = 10.0
@@ -79,9 +79,9 @@ def compare_models(ref, other, wall_weight=DEFAULT_WALL_WEIGHT):
     ta, tb, deltas = [], [], []
     worst = (0.0, None, None)
     for z in zs:
-        va, vb = ref.side_values(z), other.side_values(z)
+        ra, rb = ref.ring(z), other.ring(z)
         for j, th in enumerate(ths):
-            a, b = ring_thickness(va, th), ring_thickness(vb, th)
+            a, b = ra(th), rb(th)
             ta.append(a)
             tb.append(b)
             d = b - a
@@ -132,26 +132,52 @@ def similarity_matrix(models, wall_weight=DEFAULT_WALL_WEIGHT):
     return mat
 
 
+TABLE_MAX_ANGLES = 16
+
+
+def table_angles(models, z):
+    """Winkel (Grad) für die Messwert-Tabelle in Höhe z: alle dort gemessenen
+    Winkel aller Liner; bei mehr als 16 das 22,5°-Raster."""
+    angles = set()
+    for m in models:
+        for h, (_, t, _) in zip(m.hs, m.rows):
+            if abs(h - z) < 1e-6:
+                angles.update(round(360.0 * k / len(t), 6) for k in range(len(t)))
+    if not angles or len(angles) > TABLE_MAX_ANGLES:
+        angles = {round(360.0 * j / TABLE_MAX_ANGLES, 6) for j in range(TABLE_MAX_ANGLES)}
+    return sorted(angles)
+
+
+def angle_text(deg):
+    """'A', 'M', 'P', 'L' für die Hauptrichtungen, sonst z. B. '45°'."""
+    for name, a in zip(SIDES, SIDE_ANGLES_DEG):
+        if abs(deg - a) < 1e-6:
+            return name
+    return ("%g°" % round(deg, 2)).replace(".", ",")
+
+
 def point_table(models):
     """Messwerte aller Liner an allen gemessenen Höhen (Vereinigung).
 
-    Liefert Zeilen: (hoehe_cm, seite_index, [wert oder None, ...], [gemessen?, ...]).
-    Werte außerhalb des Messbereichs eines Liners sind None, Zwischenwerte
-    (andere Höhe als gemessen) werden interpoliert und als nicht gemessen markiert.
+    Liefert Zeilen: (hoehe_cm, winkel_grad, bezeichnung, [wert oder None, ...],
+    [gemessen?, ...]). Werte außerhalb des Messbereichs eines Liners sind None;
+    Werte, die der Liner an dieser Stelle nicht gemessen hat, werden interpoliert
+    und als nicht gemessen markiert.
     """
     heights = sorted({h for m in models for h in m.hs})
     rows = []
     for z in heights:
-        for k in range(4):
+        for deg in table_angles(models, z):
+            th = math.radians(deg)
             vals, measured = [], []
             for m in models:
                 if m.z_min - 1e-6 <= z <= m.z_max + 1e-6:
-                    vals.append(m.side_values(z)[k])
-                    measured.append(any(abs(z - h) < 1e-6 for h in m.hs))
+                    vals.append(m.thickness(z, th))
+                    measured.append(m.measured_at(z, th))
                 else:
                     vals.append(None)
                     measured.append(False)
-            rows.append((z / 10.0, k, vals, measured))
+            rows.append((z / 10.0, deg, angle_text(deg), vals, measured))
     return rows
 
 
@@ -209,5 +235,5 @@ def build_comparison(records, ref_index=0, wall_weight=DEFAULT_WALL_WEIGHT):
 
 
 __all__ = ["SIDES", "SIDE_ANGLES_DEG", "ANGLE_NAMES", "angle_label", "build_comparison", "compare_models",
-           "model_from_record", "point_table", "rank_similar", "similarity_matrix",
+           "model_from_record", "point_label", "point_table", "table_angles", "rank_similar", "similarity_matrix",
            "vertex_differences"]

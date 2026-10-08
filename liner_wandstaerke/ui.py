@@ -5,6 +5,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import webbrowser
 
 import bpy
@@ -13,7 +14,6 @@ from bpy.props import (
     CollectionProperty,
     EnumProperty,
     FloatProperty,
-    FloatVectorProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -22,9 +22,10 @@ from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import colors
-from .compare import build_comparison, model_from_record, rank_similar, vertex_differences
+from .compare import build_comparison, rank_similar, vertex_differences
 from .database import LinerDB, empty_record, record_label
-from .geometry import SIDES, LinerModel, build_liner_geometry, marker_positions
+from .geometry import (MAX_POINTS, LinerModel, build_liner_geometry, marker_positions,
+                       point_label, resample_ring)
 from .report import write_report
 
 ADDON_ID = __package__
@@ -116,16 +117,54 @@ class LINER_AP_prefs(AddonPreferences):
         self.layout.prop(self, "db_path")
 
 
+class LINER_PG_value(PropertyGroup):
+    value: FloatProperty(name="Wandstärke", description="Wandstärke in mm",
+                         default=5.0, min=0.0, soft_max=30.0, precision=1)
+
+
+_SETTING_VALUES = False
+
+
+def _on_n_points(self, context):
+    """Punktzahl geändert: vorhandene Werte auf die neue Anzahl umrechnen."""
+    if _SETTING_VALUES or len(self.values) == self.n_points:
+        return
+    old = [v.value for v in self.values] or [5.0]
+    set_row_values(self, resample_ring(old, self.n_points))
+
+
 class LINER_PG_row(PropertyGroup):
     height_cm: FloatProperty(name="Höhe", description="Höhe von distal in cm",
                              default=4.0, min=0.0, soft_max=60.0, precision=1)
-    thickness_mm: FloatVectorProperty(
-        name="Wandstärke", size=4, default=(5.0, 5.0, 5.0, 5.0),
-        min=0.0, soft_max=30.0, precision=1,
-        description="Wandstärke in mm: Anterior, Medial, Posterior, Lateral")
+    n_points: IntProperty(
+        name="Messpunkte", default=4, min=1, max=MAX_POINTS, update=_on_n_points,
+        description=("Anzahl der Messpunkte in dieser Höhe, gleichmäßig über den Umfang "
+                     "verteilt, beginnend anterior Richtung medial (4 = A, M, P, L). "
+                     "Beim Ändern werden vorhandene Werte umgerechnet"))
+    values: CollectionProperty(type=LINER_PG_value)
     circumference_cm: FloatProperty(
         name="Umfang", description="Umfang in dieser Höhe in cm",
         default=30.0, min=1.0, soft_max=80.0, precision=1)
+
+
+def set_row_values(row, values):
+    """Setzt die Wandstärken einer Zeile (Anzahl = Punktzahl)."""
+    global _SETTING_VALUES
+    values = [float(v) for v in values]
+    if not 1 <= len(values) <= MAX_POINTS:
+        raise ValueError("1 bis %d Messpunkte erlaubt" % MAX_POINTS)
+    _SETTING_VALUES = True
+    try:
+        row.values.clear()
+        for v in values:
+            row.values.add().value = v
+        row.n_points = len(values)
+    finally:
+        _SETTING_VALUES = False
+
+
+def row_values(row):
+    return [v.value for v in row.values]
 
 
 _REFRESHING = False
@@ -263,13 +302,13 @@ def _fill_rows(st, rows):
     for h, t, c in sorted(rows, key=lambda r: r[0]):
         row = st.rows.add()
         row.height_cm = h
-        row.thickness_mm = t
+        set_row_values(row, t)
         row.circumference_cm = c
     st.active_index = 0
 
 
 def _rows_as_tuples(st):
-    return [(r.height_cm, tuple(r.thickness_mm), r.circumference_cm) for r in st.rows]
+    return [(r.height_cm, tuple(row_values(r)), r.circumference_cm) for r in st.rows]
 
 
 def _editor_record(st):
@@ -462,7 +501,7 @@ class LINER_OT_add_row(Operator):
         row = st.rows.add()
         if prev:
             row.height_cm = prev.height_cm + 5.0
-            row.thickness_mm = prev.thickness_mm
+            set_row_values(row, row_values(prev))
             row.circumference_cm = prev.circumference_cm
         st.active_index = len(st.rows) - 1
         return {"FINISHED"}
@@ -484,22 +523,96 @@ class LINER_OT_remove_row(Operator):
         return {"FINISHED"}
 
 
+def _active_row(st):
+    if 0 <= st.active_index < len(st.rows):
+        return st.rows[st.active_index]
+    return None
+
+
 class LINER_OT_set_all(Operator):
     bl_idname = "liner.set_all"
-    bl_label = "Alle 4 Seiten gleich"
-    bl_description = "Den Anterior-Wert der aktiven Zeile auf M, P und L übertragen"
+    bl_label = "Alle Punkte gleich"
+    bl_description = "Den ersten Wert (anterior) der aktiven Höhe auf alle Messpunkte übertragen"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        st = _settings(context)
-        return 0 <= st.active_index < len(st.rows)
+        return _active_row(_settings(context)) is not None
 
     def execute(self, context):
-        st = _settings(context)
-        row = st.rows[st.active_index]
-        v = row.thickness_mm[0]
-        row.thickness_mm = (v, v, v, v)
+        row = _active_row(_settings(context))
+        v = row.values[0].value if len(row.values) else 5.0
+        set_row_values(row, [v] * row.n_points)
+        return {"FINISHED"}
+
+
+def parse_numbers(text):
+    """Zahlen aus Text (z. B. Zwischenablage, Excel-Spalte). Trennzeichen: Leerzeichen,
+    Tabulator, Zeilenumbruch oder Semikolon; Dezimalkomma oder -punkt."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if re.search(r"[;\s]", text):
+        tokens = re.split(r"[;\s]+", text)
+        tokens = [t.replace(",", ".") for t in tokens if t]
+    else:
+        tokens = [t for t in text.split(",") if t]
+    try:
+        return [float(t) for t in tokens]
+    except ValueError:
+        raise ValueError("Keine gültige Zahlenliste: %s" % text[:60])
+
+
+class LINER_OT_paste_values(Operator):
+    bl_idname = "liner.paste_values"
+    bl_label = "Werte einfügen"
+    bl_description = ("Wandstärken der aktiven Höhe aus der Zwischenablage übernehmen "
+                      "(z. B. eine Spalte aus Excel). Die Punktzahl ergibt sich aus der Anzahl "
+                      "der Werte; der erste Wert ist anterior")
+    bl_options = {"REGISTER", "UNDO"}
+
+    text: StringProperty(options={"SKIP_SAVE"},
+                         description="Statt der Zwischenablage diesen Text verwenden")
+
+    @classmethod
+    def poll(cls, context):
+        return _active_row(_settings(context)) is not None
+
+    def execute(self, context):
+        row = _active_row(_settings(context))
+        text = self.text or context.window_manager.clipboard
+        try:
+            values = parse_numbers(text)
+            if not values:
+                raise ValueError("Zwischenablage enthält keine Zahlen")
+            if min(values) <= 0.0:
+                raise ValueError("Wandstärken müssen größer als 0 sein")
+            set_row_values(row, values)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "%d Werte für %g cm übernommen" % (len(values), row.height_cm))
+        return {"FINISHED"}
+
+
+class LINER_OT_set_points_all(Operator):
+    bl_idname = "liner.set_points_all"
+    bl_label = "Punktzahl für alle Höhen"
+    bl_description = ("Für alle Höhen dieselbe Anzahl Messpunkte einstellen; "
+                      "vorhandene Werte werden umgerechnet")
+    bl_options = {"REGISTER", "UNDO"}
+
+    n_points: IntProperty(name="Messpunkte je Höhe", default=4, min=1, max=MAX_POINTS)
+
+    def invoke(self, context, event):
+        row = _active_row(_settings(context))
+        if row is not None:
+            self.n_points = row.n_points
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        for row in _settings(context).rows:
+            row.n_points = self.n_points
         return {"FINISHED"}
 
 
@@ -590,7 +703,7 @@ class LINER_OT_build(Operator):
             mesh.name = OBJECT_NAME
 
         obj["liner_messwerte"] = [
-            {"hoehe_cm": h, "A": t[0], "M": t[1], "P": t[2], "L": t[3], "umfang_cm": c}
+            {"hoehe_cm": h, "punkte": len(t), "werte_mm": list(t), "umfang_cm": c}
             for (h, t, c) in sorted(rows)
         ]
         obj["liner_seite"] = st.side
@@ -637,6 +750,49 @@ class LINER_OT_build(Operator):
                 coll.objects.link(txt)
 
 
+def parse_editor_csv(text, delim=";"):
+    """Liest die Messtabelle eines einzelnen Liners.
+
+    Neues Format: Kopfzeile hoehe_cm;umfang_cm;anzahl_punkte;w1;w2;...
+    Altes Format: hoehe_cm;anterior_mm;medial_mm;posterior_mm;lateral_mm;umfang_cm
+    Danach optional Zeilen 'schluessel;wert' mit Stammdaten.
+    """
+    rows, meta, header = [], {}, None
+    for line, rec in enumerate(csv.reader(text.splitlines(), delimiter=delim), start=1):
+        rec = [c.strip() for c in rec]
+        if not any(rec):
+            continue
+        if rec[0].lower() == "hoehe_cm":
+            header = [c.lower() for c in rec]
+            continue
+        try:
+            float(rec[0].replace(",", "."))
+        except ValueError:
+            meta[rec[0].lower()] = rec[1] if len(rec) > 1 else ""
+            continue
+        num = lambda c: float(c.replace(",", "."))  # noqa: E731
+        try:
+            if header and "anzahl_punkte" in header:
+                i_h, i_c, i_n = (header.index(k) for k in ("hoehe_cm", "umfang_cm",
+                                                           "anzahl_punkte"))
+                n = int(num(rec[i_n]))
+                first = header.index("w1")
+                vals = [num(c) for c in rec[first:first + n] if c]
+                if not 1 <= n <= MAX_POINTS or len(vals) != n:
+                    raise ValueError
+                rows.append((num(rec[i_h]), tuple(vals), num(rec[i_c])))
+            else:
+                nums = [num(c) for c in rec if c]
+                if len(nums) < 6:
+                    raise ValueError
+                rows.append((nums[0], tuple(nums[1:5]), nums[5]))
+        except (ValueError, IndexError):
+            raise ValueError("Zeile %d ist keine gültige Messzeile" % line)
+    if not rows:
+        raise ValueError("Keine Messzeilen gefunden")
+    return rows, meta
+
+
 class LINER_OT_export_csv(Operator, ExportHelper):
     bl_idname = "liner.export_csv"
     bl_label = "Messwerte exportieren"
@@ -648,10 +804,13 @@ class LINER_OT_export_csv(Operator, ExportHelper):
         st = _settings(context)
         with open(self.filepath, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["hoehe_cm", "anterior_mm", "medial_mm", "posterior_mm",
-                        "lateral_mm", "umfang_cm"])
-            for h, t, c in sorted(_rows_as_tuples(st)):
-                w.writerow(["%g" % h] + ["%g" % v for v in t] + ["%g" % c])
+            rows = sorted(_rows_as_tuples(st))
+            n_max = max(len(t) for _, t, _ in rows) if rows else 4
+            w.writerow(["hoehe_cm", "umfang_cm", "anzahl_punkte"]
+                       + ["w%d" % (i + 1) for i in range(n_max)])
+            for h, t, c in rows:
+                w.writerow(["%g" % h, "%g" % c, len(t)] + ["%g" % v for v in t]
+                           + [""] * (n_max - len(t)))
             w.writerow([])
             for key in ("hersteller", "artikel", "groesse", "form", "material", "notiz"):
                 w.writerow([key, getattr(st, key)])
@@ -676,19 +835,11 @@ class LINER_OT_import_csv(Operator, ImportHelper):
         with open(self.filepath, newline="", encoding="utf-8-sig") as f:
             text = f.read()
         delim = ";" if text.count(";") >= text.count(",") else ","
-        rows, meta = [], {}
-        for rec in csv.reader(text.splitlines(), delimiter=delim):
-            rec = [c.strip() for c in rec]
-            if not any(rec):
-                continue
-            try:
-                nums = [float(c.replace(",", ".")) for c in rec if c]
-            except ValueError:
-                if len(rec) >= 1:
-                    meta[rec[0].lower()] = rec[1] if len(rec) > 1 else ""
-                continue
-            if len(nums) >= 6:
-                rows.append((nums[0], tuple(nums[1:5]), nums[5]))
+        try:
+            rows, meta = parse_editor_csv(text, delim)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         if not rows:
             self.report({"ERROR"}, "Keine Messzeilen gefunden")
             return {"CANCELLED"}
@@ -1098,9 +1249,31 @@ class LINER_UL_rows(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "height_cm", text="")
-        for k in range(4):
-            row.prop(item, "thickness_mm", index=k, text="")
+        row.prop(item, "n_points", text="")
         row.prop(item, "circumference_cm", text="")
+        vals = row_values(item)
+        sub = row.row()
+        sub.alignment = "RIGHT"
+        sub.label(text="Ø %.1f" % (sum(vals) / len(vals)) if vals else "–")
+
+
+def _draw_points(layout, row):
+    """Eingabefelder der Messpunkte der aktiven Höhe."""
+    n = row.n_points
+    box = layout.box()
+    head = box.row()
+    step = 360.0 / n
+    head.label(text="Messpunkte bei %g cm: %d %s" % (
+        row.height_cm, n, "Punkt (rundum gleich)" if n == 1
+        else "Punkte, alle %s°" % ("%g" % round(step, 3)).replace(".", ",")))
+    ops = box.row(align=True)
+    ops.operator("liner.set_all", icon="LINKED")
+    ops.operator("liner.paste_values", icon="PASTEDOWN", text="Einfügen")
+    ops.operator("liner.set_points_all", icon="PROPERTIES", text="Alle Höhen")
+    cols = 4 if n % 4 == 0 or n > 8 else min(n, 3) or 1
+    grid = box.grid_flow(row_major=True, columns=cols, even_columns=True, align=True)
+    for k, item in enumerate(row.values):
+        grid.prop(item, "value", text=point_label(k, n))
 
 
 class LINER_UL_db(UIList):
@@ -1142,9 +1315,9 @@ class LINER_PT_main(Panel):
         layout.prop(st, "side", expand=True)
 
         box = layout.box()
-        box.label(text="Messtabelle (Höhe cm · Wandstärke mm · Umfang cm)")
+        box.label(text="Messhöhen (Höhe cm · Messpunkte · Umfang cm · Ø Wand mm)")
         hdr = box.row(align=True)
-        for label in ("Höhe", "A 0°", "M 90°", "P 180°", "L 270°", "Umfang"):
+        for label in ("Höhe", "Punkte", "Umfang", "Ø mm"):
             hdr.label(text=label)
         row = box.row()
         row.template_list("LINER_UL_rows", "", st, "rows", st, "active_index", rows=8)
@@ -1155,6 +1328,9 @@ class LINER_PT_main(Panel):
         side.operator("liner.set_all", text="", icon="LINKED")
         side.separator()
         side.operator("liner.reset_rows", text="", icon="FILE_REFRESH")
+        active = _active_row(st)
+        if active is not None:
+            _draw_points(box, active)
 
         col = layout.column(align=True)
         col.prop(st, "circ_reference")
@@ -1306,6 +1482,7 @@ class LINER_PT_compare(Panel):
 
 classes = (
     LINER_AP_prefs,
+    LINER_PG_value,
     LINER_PG_row,
     LINER_PG_dbitem,
     LINER_PG_result,
@@ -1314,6 +1491,8 @@ classes = (
     LINER_OT_add_row,
     LINER_OT_remove_row,
     LINER_OT_set_all,
+    LINER_OT_paste_values,
+    LINER_OT_set_points_all,
     LINER_OT_new_record,
     LINER_OT_save_record,
     LINER_OT_build,
